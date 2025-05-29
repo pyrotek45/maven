@@ -1,4 +1,4 @@
-# spr
+# maven
 
 A fast, terminal-based spreadsheet for Linux, inspired by Vim and designed for power users and data wranglers.
 
@@ -55,9 +55,9 @@ cargo run --release [optional.csv]
 
 ## Command Mode (`:`)
 
-- `:w <file>`      — Save as CSV
+- `:w `      — Save as CSV
 - `:q`             — Quit
-- `:wq <file>`     — Save and quit
+- `:wq `     — Save and quit
 - `:load <file>`   — Load CSV file
 - `:save <file>`   — Save as CSV
 - `:files`         — Show files in current directory
@@ -98,12 +98,6 @@ Tab completion works for file paths in `:load` and `:save`.
 - Use tab completion for file paths.
 - Inspector bar shows current cell and sheet info.
 - Multiple files: open with `:tabnew <file>`, switch with `Tab`.
-
----
-
-## License
-
-MIT
 
 ---
 
