@@ -1,0 +1,9 @@
+[package]
+name = "spr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.27.0"
+ratatui = { version = "0.26.1", features = ["all-widgets"] }
+csv = "1.1"
