@@ -2196,6 +2196,24 @@ fn run_app<B: ratatui::backend::Backend>(
                 } else {
                     match app.mode {
                         Mode::Normal => match key.code {
+                            // o/O should open new row below/above
+                            KeyCode::Char('o') if key.modifiers.is_empty() => {
+                                app.snapshot();
+                                app.insert_row(app.cursor_row + 1);
+                                app.cursor_row += 1;
+                                app.command_msg = format!(
+                                    "New row inserted below row {}",
+                                    app.cursor_row
+                                );
+                            }
+                            KeyCode::Char('O') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                app.snapshot();
+                                app.insert_row(app.cursor_row);
+                                app.command_msg = format!(
+                                    "New row inserted above row {}",
+                                    app.cursor_row
+                                );
+                            }
                             // r for result into cell
                             KeyCode::Char('r') if key.modifiers.is_empty() => {
                                 if app.result.is_some() {
