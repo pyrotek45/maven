@@ -13,7 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph}, // Keep List, ListItem as they are used in PopupMenu::draw indirectly
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque, HashSet},
     env,
     fs,
     fs::File,
@@ -21,6 +21,352 @@ use std::{
     path::PathBuf, // Removed unused Path
     time::Duration,
 }; // Added env
+
+#[derive(Clone, Debug)]
+pub enum CellValue {
+    Text(String),
+    Number(f64),
+    Formula(String), // Lua expression, e.g. "A1 + B2"
+}
+
+#[derive(Clone)]
+struct Cell {
+    value: CellValue,
+}
+
+impl Cell {
+    pub fn from_content(content: &str) -> Self {
+        if let Some(rest) = content.strip_prefix('=') {
+            Cell { value: CellValue::Formula(rest.to_string()) }
+        } else if let Ok(n) = content.parse::<f64>() {
+            Cell { value: CellValue::Number(n) }
+        } else {
+            Cell { value: CellValue::Text(content.to_string()) }
+        }
+    }
+    pub fn to_content(&self) -> String {
+        match &self.value {
+            CellValue::Text(s) => s.clone(),
+            CellValue::Number(n) => n.to_string(),
+            CellValue::Formula(expr) => format!("={}", expr),
+        }
+    }
+}
+
+// Convert (row, col) to Excel-style name (A1, B2, etc.)
+pub fn cell_name(row: usize, col: usize) -> String {
+    let mut col_str = String::new();
+    let mut col_num = col + 1;
+    while col_num > 0 {
+        let rem = (col_num - 1) % 26;
+        col_str.insert(0, (b'A' + rem as u8) as char);
+        col_num = (col_num - 1) / 26;
+    }
+    format!("{}{}", col_str, row + 1)
+}
+
+// Convert Excel-style name to (row, col)
+pub fn parse_cell_name(name: &str) -> Option<(usize, usize)> {
+    let mut col = 0;
+    let mut row = 0;
+    let mut chars = name.chars();
+    // Parse column (letters)
+    while let Some(c) = chars.clone().next() {
+        if c.is_ascii_alphabetic() {
+            col = col * 26 + ((c.to_ascii_uppercase() as u8 - b'A') as usize + 1);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    // Parse row (numbers)
+    let row_str: String = chars.collect();
+    if row_str.is_empty() {
+        return None;
+    }
+    row = row_str.parse::<usize>().ok()?;
+    Some((row - 1, col - 1))
+}
+
+// --- Remove Lua support: delete use mlua, SpreadsheetContext, evaluate_formula, and Lua usage ---
+
+// --- Enhanced formula evaluator: support SUM and ranges ---
+#[derive(Debug, Clone)]
+enum Expr {
+    Number(f64),
+    CellRef(usize, usize),
+    Range((usize, usize), (usize, usize)),
+    BinaryOp(Box<Expr>, Op, Box<Expr>),
+    FuncCall(String, Vec<Expr>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+// Parse a cell reference like "A0" into (row, col), where both are zero-based.
+// E.g. "A0" -> (0, 0), "B2" -> (2, 1), "AA0" -> (0, 26)
+fn parse_cell_ref(s: &str) -> Option<(usize, usize)> {
+    let mut col = 0;
+    let mut chars = s.chars().peekable();
+    let mut col_len = 0;
+    while let Some(&c) = chars.peek() {
+        match c {
+            'A'..='Z' | 'a'..='z' => {
+                col = col * 26 + ((c.to_ascii_uppercase() as u8 - b'A') as usize);
+                chars.next();
+                col_len += 1;
+            }
+            _ => break,
+        }
+    }
+    if col_len == 0 {
+        return None;
+    }
+    let row_str: String = chars.collect();
+    if row_str.is_empty() {
+        return None;
+    }
+    let row = row_str.parse::<usize>().ok()?;
+    Some((row, col))
+}
+
+// A very simple recursive descent parser for +, -, *, /, (), and cell refs
+fn parse_expr(input: &str) -> Option<Expr> {
+    let tokens = tokenize(input);
+    let (expr, rest) = parse_expr_bp(&tokens, 0)?;
+    if rest.is_empty() { Some(expr) } else { None }
+}
+
+fn tokenize(input: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            '0'..='9' | '.' => {
+                let mut num = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() || d == '.' {
+                        num.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Ok(n) = num.parse() {
+                    tokens.push(Token::Number(n));
+                }
+            }
+            'A'..='Z' | 'a'..='z' => {
+                let mut ident = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_alphabetic() || d.is_ascii_digit() {
+                        ident.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(Token::Ident(ident));
+            }
+            ':' => { tokens.push(Token::Colon); chars.next(); }
+            ',' => { tokens.push(Token::Comma); chars.next(); }
+            '+' => { tokens.push(Token::Plus); chars.next(); }
+            '-' => { tokens.push(Token::Minus); chars.next(); }
+            '*' => { tokens.push(Token::Star); chars.next(); }
+            '/' => { tokens.push(Token::Slash); chars.next(); }
+            '(' => { tokens.push(Token::LParen); chars.next(); }
+            ')' => { tokens.push(Token::RParen); chars.next(); }
+            ' ' | '\t' => { chars.next(); }
+            _ => { chars.next(); }
+        }
+    }
+    tokens
+}
+
+#[derive(Debug, Clone)]
+enum Token {
+    Number(f64),
+    Ident(String),
+    Colon,
+    Comma,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+}
+
+// Pratt parser with support for ranges and function calls
+fn parse_expr_bp(tokens: &[Token], min_bp: u8) -> Option<(Expr, &[Token])> {
+    let (mut lhs, mut rest) = match tokens.first()? {
+        Token::Number(n) => (Expr::Number(*n), &tokens[1..]),
+        Token::Ident(s) => {
+            // Function call or cell ref or range
+            if let Some(Token::LParen) = tokens.get(1) {
+                // Function call
+                let mut args = Vec::new();
+                let mut rem = &tokens[2..];
+                if let Some(Token::RParen) = rem.first() {
+                    rem = &rem[1..];
+                } else {
+                    loop {
+                        let (arg, new_rem) = parse_expr_bp(rem, 0)?;
+                        args.push(arg);
+                        rem = new_rem;
+                        match rem.first() {
+                            Some(Token::Comma) => rem = &rem[1..],
+                            Some(Token::RParen) => { rem = &rem[1..]; break; },
+                            _ => return None,
+                        }
+                    }
+                }
+                (Expr::FuncCall(s.to_ascii_uppercase(), args), rem)
+            } else if let Some(Token::Colon) = tokens.get(1) {
+                // Range: e.g. B7:D7
+                if let (Some((r1, c1)), Some(Token::Ident(s2))) = (parse_cell_ref(s), tokens.get(2)) {
+                    if let Some((r2, c2)) = parse_cell_ref(s2) {
+                        (Expr::Range((r1, c1), (r2, c2)), &tokens[3..])
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                // Cell ref
+                if let Some((r, c)) = parse_cell_ref(s) {
+                    (Expr::CellRef(r, c), &tokens[1..])
+                } else {
+                    return None;
+                }
+            }
+        }
+        Token::Minus => {
+            let (rhs, rest) = parse_expr_bp(&tokens[1..], 100)?;
+            (Expr::BinaryOp(Box::new(Expr::Number(0.0)), Op::Sub, Box::new(rhs)), rest)
+        }
+        Token::LParen => {
+            let (expr, rest) = parse_expr_bp(&tokens[1..], 0)?;
+            if let Some(Token::RParen) = rest.first() {
+                (expr, &rest[1..])
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    loop {
+        let op = match rest.first() {
+            Some(Token::Plus) => Op::Add,
+            Some(Token::Minus) => Op::Sub,
+            Some(Token::Star) => Op::Mul,
+            Some(Token::Slash) => Op::Div,
+            _ => break,
+        };
+        let (l_bp, r_bp) = match op {
+            Op::Add | Op::Sub => (1, 2),
+            Op::Mul | Op::Div => (3, 4),
+        };
+        if l_bp < min_bp { break; }
+        rest = &rest[1..];
+        let (rhs, new_rest) = parse_expr_bp(rest, r_bp)?;
+        lhs = Expr::BinaryOp(Box::new(lhs), op, Box::new(rhs));
+        rest = new_rest;
+    }
+    Some((lhs, rest))
+}
+
+// Evaluate the expression, using a cell map for lookups
+fn eval_expr(
+    expr: &Expr,
+    cell_map: &HashMap<(usize, usize), &CellValue>,
+    visited: &mut HashSet<(usize, usize)>
+) -> f64 {
+    match expr {
+        Expr::Number(n) => *n,
+        Expr::CellRef(r, c) => {
+            // Detect circular reference
+            if !visited.insert((*r, *c)) {
+                // Already visited: circular reference!
+                return f64::NAN;
+            }
+            let result = match cell_map.get(&(*r, *c)) {
+                Some(CellValue::Number(n)) => *n,
+                Some(CellValue::Formula(expr_str)) => {
+                    if let Some(expr) = parse_expr(expr_str) {
+                        let val = eval_expr(&expr, cell_map, visited);
+                        val
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            // Only remove if this was the top-level call for this cell
+            visited.remove(&(*r, *c));
+            result
+        }
+        Expr::Range((r1, c1), (r2, c2)) => {
+            let (rmin, rmax) = (r1.min(r2), r1.max(r2));
+            let (cmin, cmax) = (c1.min(c2), c1.max(c2));
+            let mut sum = 0.0;
+            for r in *rmin..=*rmax {
+                for c in *cmin..=*cmax {
+                    // If already visited, treat as circular reference for this cell
+                    if visited.contains(&(r, c)) {
+                        sum += f64::NAN;
+                        continue;
+                    }
+                    if let Some(CellValue::Number(n)) = cell_map.get(&(r, c)) {
+                        sum += *n;
+                    } else if let Some(CellValue::Formula(expr_str)) = cell_map.get(&(r, c)) {
+                        if let Some(expr) = parse_expr(expr_str) {
+                            visited.insert((r, c));
+                            let val = eval_expr(&expr, cell_map, visited);
+                            visited.remove(&(r, c));
+                            sum += val;
+                        }
+                    }
+                }
+            }
+            sum
+        }
+        Expr::BinaryOp(lhs, op, rhs) => {
+            let a = eval_expr(lhs, cell_map, visited);
+            let b = eval_expr(rhs, cell_map, visited);
+            match op {
+                Op::Add => a + b,
+                Op::Sub => a - b,
+                Op::Mul => a * b,
+                Op::Div => if b == 0.0 { 0.0 } else { a / b },
+            }
+        }
+        Expr::FuncCall(name, args) => {
+            match name.as_str() {
+                "SUM" => args.iter().map(|e| eval_expr(e, cell_map, visited)).sum(),
+                "AVERAGE" => {
+                    let sum: f64 = args.iter().map(|e| eval_expr(e, cell_map, visited)).sum();
+                    let count = args.len() as f64;
+                    if count > 0.0 { sum / count } else { 0.0 }
+                }
+                "COUNT" => args.iter().filter_map(|e| {
+                    let val = eval_expr(e, cell_map, visited);
+                    if val.is_finite() { Some(1.0) } else { None }
+                }).sum(),
+                "MAX" => args.iter().map(|e| eval_expr(e, cell_map, visited)).fold(f64::NEG_INFINITY, f64::max),
+                "MIN" => args.iter().map(|e| eval_expr(e, cell_map, visited)).fold(f64::INFINITY, f64::min),
+                _ => 0.0,
+            }
+        }
+    }
+}
+//  --- End native formula evaluator ---
 
 #[derive(Debug, PartialEq, Clone)] // Added Debug
 enum Mode {
@@ -30,11 +376,6 @@ enum Mode {
     VisualRow,
     VisualColumn,
     VisualBlock,
-}
-
-#[derive(Clone)]
-struct Cell {
-    content: String,
 }
 
 #[derive(Clone)]
@@ -75,15 +416,58 @@ struct App {
     filepath: Option<PathBuf>,             // Store the path of the currently loaded file
 
     last_selection_range: Option<((usize, usize), (usize, usize))>, // Last selected range for commands
+    insert_mode_cursor: usize
 }
 
 impl App {
+    // delete row and column methods
+    /// Delete a row at the specified index.
+    pub fn delete_row(&mut self, index: usize) {
+        if index < self.rows {
+            self.cells.remove(index);
+            self.rows = self.rows.saturating_sub(1);
+        }
+    }
+
+    /// Delete a column at the specified index.
+    pub fn delete_col(&mut self, index: usize) {
+        if index < self.cols {
+            for row in &mut self.cells {
+                row.remove(index);
+            }
+            self.cols = self.cols.saturating_sub(1);
+        }
+    }
+
+
+    /// Insert a new row at the specified index.
+    pub fn insert_row(&mut self, index: usize) {
+        let idx = index.min(self.rows);
+        let new_row = vec![
+            Cell {
+                value: CellValue::Text("".to_string())
+            };
+            self.cols
+        ];
+        self.cells.insert(idx, new_row);
+        self.rows += 1;
+    }
+
+    /// Insert a new column at the specified index.
+    pub fn insert_col(&mut self, index: usize) {
+        let idx = index.min(self.cols);
+        for row in &mut self.cells {
+            row.insert(idx, Cell { value: CellValue::Text("".to_string()) });
+        }
+        self.cols += 1;
+    }
+
     pub fn new(rows: usize, cols: usize) -> Self {
         let cwidth = 10;
         let cells = vec![
             vec![
                 Cell {
-                    content: "".to_string()
+                    value: CellValue::Text("".to_string())
                 };
                 cols
             ];
@@ -118,6 +502,7 @@ impl App {
             tab_completion_path_prefix: String::new(),
             filepath: None,
             last_selection_range: None, // Initialize to None
+            insert_mode_cursor: 0, // Initialize insert mode cursor position
         }
     }
     /// Take a snapshot of the current state for undo/redo.
@@ -322,7 +707,7 @@ fn execute_sort(
             let mut row_indices_to_sort: Vec<usize> = (r1..=r2).collect();
             row_indices_to_sort.sort_by_cached_key(|&row_idx| {
                 app.cells[row_idx][sort_key_row_index.min(app.cols.saturating_sub(1))]
-                    .content
+                    .to_content()
                     .clone()
             });
             if params.sort_order == SortOrder::Descending {
@@ -331,10 +716,10 @@ fn execute_sort(
             row_indices_to_sort.sort_by(|&row_a_idx, &row_b_idx| {
                 let val_a = &app.cells[row_a_idx]
                     [sort_key_row_index.min(app.cols.saturating_sub(1))]
-                .content;
+                .to_content();
                 let val_b = &app.cells[row_b_idx]
                     [sort_key_row_index.min(app.cols.saturating_sub(1))]
-                .content;
+                .to_content();
                 compare_values(val_a, val_b, params.sort_type, params.sort_order)
             });
             let mut new_cells_state = app.cells.clone();
@@ -391,7 +776,7 @@ fn execute_sort(
             let mut row_indices_to_sort: Vec<usize> = (r1..=r2).collect();
             row_indices_to_sort.sort_by_cached_key(|&row_idx| {
                 app.cells[row_idx][sort_key_column_index.min(app.cols.saturating_sub(1))]
-                    .content
+                    .to_content()
                     .clone()
             });
             if params.sort_order == SortOrder::Descending {
@@ -400,10 +785,10 @@ fn execute_sort(
             row_indices_to_sort.sort_by(|&row_a_idx, &row_b_idx| {
                 let val_a = &app.cells[row_a_idx]
                     [sort_key_column_index.min(app.cols.saturating_sub(1))]
-                .content;
+                .to_content();
                 let val_b = &app.cells[row_b_idx]
                     [sort_key_column_index.min(app.cols.saturating_sub(1))]
-                .content;
+                .to_content();
                 compare_values(val_a, val_b, params.sort_type, params.sort_order)
             });
             let mut new_cells_state = app.cells.clone();
@@ -466,7 +851,7 @@ fn execute_sort(
             let mut row_indices_to_sort: Vec<usize> = (r1..=r2).collect();
             row_indices_to_sort.sort_by_cached_key(|&row_idx| {
                 app.cells[row_idx][sort_key_column_index.min(app.cols.saturating_sub(1))]
-                    .content
+                    .to_content()
                     .clone()
             });
             if params.sort_order == SortOrder::Descending {
@@ -475,10 +860,10 @@ fn execute_sort(
             row_indices_to_sort.sort_by(|&row_a_idx, &row_b_idx| {
                 let val_a = &app.cells[row_a_idx]
                     [sort_key_column_index.min(app.cols.saturating_sub(1))]
-                .content;
+                .to_content();
                 let val_b = &app.cells[row_b_idx]
                     [sort_key_column_index.min(app.cols.saturating_sub(1))]
-                .content;
+                .to_content();
                 compare_values(val_a, val_b, params.sort_type, params.sort_order)
             });
 
@@ -927,6 +1312,22 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             app.command_msg += " Exiting...";
             return CommandStatus::Exit;
         }
+        // num -> turns all cells to numbers, if cell is string, it will try to parse it as a number, if formula, it will keep it as text
+        Some("num") | Some("number") => {
+            app.snapshot();
+            for row in &mut app.cells {
+                for cell in row {
+                    if let CellValue::Text(ref text) = cell.value {
+                        if let Ok(num) = text.trim().parse::<f64>() {
+                            cell.value = CellValue::Number(num);
+                        } else {
+                            cell.value = CellValue::Text(text.clone()); // Keep original text if parse fails
+                        }
+                    }
+                }
+            }
+            app.command_msg = "Converted all cells to numbers where possible".to_string();
+        }
         // goto <row> [: <col>]
         Some("goto") => {
             if let Some(row_str) = args.first() {
@@ -997,7 +1398,12 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
                 for r in r1..=r2 {
                 for c in c1..=c2 {
                     if r < app.rows && c < app.cols {
-                    app.cells[r][c].content = content_arg.to_string();
+                    // Try to parse as number, else store as text
+                    if let Ok(num) = content_arg.parse::<f64>() {
+                        app.cells[r][c].value = CellValue::Number(num);
+                    } else {
+                        app.cells[r][c].value = CellValue::Text(content_arg.to_string());
+                    }
                     }
                 }
                 }
@@ -1011,13 +1417,18 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             } else if !app.clipboard.is_empty() {
             // No argument, but clipboard has content, use clipboard
             // Assuming clipboard contains a single cell's content for fill for simplicity
-            let clipboard_content_to_fill = app.clipboard[0][0].content.clone();
+            let clipboard_content_to_fill = app.clipboard[0][0].to_content();
             if let Some(((r1, c1), (r2, c2))) = app.selected_range() {
                 app.snapshot(); // Save current state before filling
                 for r in r1..=r2 {
                 for c in c1..=c2 {
                     if r < app.rows && c < app.cols {
-                    app.cells[r][c].content = clipboard_content_to_fill.clone();
+                    // Try to parse as number, else store as text
+                    if let Ok(num) = clipboard_content_to_fill.parse::<f64>() {
+                        app.cells[r][c].value = CellValue::Number(num);
+                    } else {
+                        app.cells[r][c].value = CellValue::Text(clipboard_content_to_fill.clone());
+                    }
                     }
                 }
                 }
@@ -1039,7 +1450,7 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             app.cells = vec![
                 vec![
                     Cell {
-                        content: "".to_string()
+                        value: CellValue::Text("".to_string())
                     };
                     app.cols
                 ];
@@ -1055,6 +1466,144 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             app.redo();
             app.command_msg = "Redone last action".to_string();
         }
+        // new (r | c | rc) [number], creates new row(s) or column(s) at cursor or selection
+        Some("new") => {
+            if args.is_empty() {
+            app.command_msg = "Usage: new <r|c|rc> [number]".to_string();
+            } else {
+            let count = if args.len() > 1 {
+                args[1].parse::<usize>().unwrap_or(1).max(1)
+            } else {
+                1
+            };
+            match args[0] {
+                "r" | "row" => {
+                app.snapshot();
+                let insert_at = if let Some(((r1, _), (r2, _))) = app.selected_range() {
+                    r1.min(r2)
+                } else {
+                    app.cursor_row
+                };
+                for _ in 0..count {
+                    app.insert_row(insert_at);
+                }
+                app.command_msg = format!("Inserted {} new row(s) at {}", count, insert_at);
+                }
+                "c" | "col" => {
+                app.snapshot();
+                let insert_at = if let Some(((_, c1), (_, c2))) = app.selected_range() {
+                    c1.min(c2)
+                } else {
+                    app.cursor_col
+                };
+                for _ in 0..count {
+                    app.insert_col(insert_at);
+                }
+                app.command_msg = format!("Inserted {} new column(s) at {}", count, insert_at);
+                }
+                "rc" | "rowcol" => {
+                app.snapshot();
+                let insert_row_at = if let Some(((r1, _), (r2, _))) = app.selected_range() {
+                    r1.min(r2)
+                } else {
+                    app.cursor_row
+                };
+                let insert_col_at = if let Some(((_, c1), (_, c2))) = app.selected_range() {
+                    c1.min(c2)
+                } else {
+                    app.cursor_col
+                };
+                for _ in 0..count {
+                    app.insert_row(insert_row_at);
+                    app.insert_col(insert_col_at);
+                }
+                app.command_msg = format!(
+                    "Inserted {} new row(s) at {} and column(s) at {}",
+                    count, insert_row_at, insert_col_at
+                );
+                }
+                _ => {
+                app.command_msg = "Invalid argument for new command".to_string();
+                }
+            }
+            }
+        }
+        // delete (r | c | rc), deletes row(s) or column(s) at cursor or selection
+        Some("delete") => {
+            if args.is_empty() {
+            app.command_msg = "Usage: delete <r|c|rc>".to_string();
+            } else {
+            match args[0] {
+                "r" | "row" => {
+                let (start, end) = if let Some(((r1, _), (r2, _))) = app.selected_range() {
+                    (r1.min(r2), r1.max(r2))
+                } else {
+                    (app.cursor_row, app.cursor_row)
+                };
+                let num_to_delete = end - start + 1;
+                if app.rows > num_to_delete {
+                    app.snapshot();
+                    for _ in start..=end {
+                    app.delete_row(start);
+                    }
+                    app.command_msg = format!("Deleted row(s) {} to {}", start, end);
+                } else {
+                    app.command_msg = "Cannot delete all rows".to_string();
+                }
+                }
+                "c" | "col" => {
+                let (start, end) = if let Some(((_, c1), (_, c2))) = app.selected_range() {
+                    (c1.min(c2), c1.max(c2))
+                } else {
+                    (app.cursor_col, app.cursor_col)
+                };
+                let num_to_delete = end - start + 1;
+                if app.cols > num_to_delete {
+                    app.snapshot();
+                    for _ in start..=end {
+                    app.delete_col(start);
+                    }
+                    app.command_msg = format!("Deleted column(s) {} to {}", start, end);
+                } else {
+                    app.command_msg = "Cannot delete all columns".to_string();
+                }
+                }
+                "rc" | "rowcol" => {
+                let (row_start, row_end) = if let Some(((r1, _), (r2, _))) = app.selected_range() {
+                    (r1.min(r2), r1.max(r2))
+                } else {
+                    (app.cursor_row, app.cursor_row)
+                };
+                let (col_start, col_end) = if let Some(((_, c1), (_, c2))) = app.selected_range() {
+                    (c1.min(c2), c1.max(c2))
+                } else {
+                    (app.cursor_col, app.cursor_col)
+                };
+                let num_rows = row_end - row_start + 1;
+                let num_cols = col_end - col_start + 1;
+                if app.rows > num_rows && app.cols > num_cols {
+                    app.snapshot();
+                    for _ in row_start..=row_end {
+                    app.delete_row(row_start);
+                    }
+                    for _ in col_start..=col_end {
+                    app.delete_col(col_start);
+                    }
+                    app.command_msg = format!(
+                    "Deleted row(s) {} to {} and column(s) {} to {}",
+                    row_start, row_end, col_start, col_end
+                    );
+                } else {
+                    app.command_msg = "Cannot delete all rows or columns".to_string();
+                }
+                }
+                _ => {
+                app.command_msg = "Invalid argument for delete command".to_string();
+                }
+            }
+            }
+        }
+
         Some("save") => {
             if let Some(path) = args.first() {
                 match save_csv(app, path) {
@@ -1109,7 +1658,7 @@ fn save_csv(app: &App, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     for r in 0..app.rows {
         let mut row_has_data = false;
         for c in 0..app.cols {
-            if !app.cells[r][c].content.is_empty() {
+            if !app.cells[r][c].to_content().is_empty() {
                 row_has_data = true;
                 actual_cols = actual_cols.max(c + 1);
             }
@@ -1119,17 +1668,25 @@ fn save_csv(app: &App, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Collect all cell contents as Strings first to manage lifetimes
+    let mut all_cell_data: Vec<Vec<String>> = Vec::with_capacity(actual_rows);
     for r_idx in 0..actual_rows {
-        let record: Vec<&str> = (0..actual_cols)
+        let row_data: Vec<String> = (0..actual_cols)
             .map(|c_idx| {
-                // Ensure we are within the bounds of the app's cell structure for safety,
-                // though actual_cols should be derived from these bounds.
                 if r_idx < app.rows && c_idx < app.cols {
-                    app.cells[r_idx][c_idx].content.as_str()
+                    app.cells[r_idx][c_idx].to_content()
                 } else {
-                    "" // Should ideally not be reached if logic is correct
+                    String::new()
                 }
             })
+            .collect();
+        all_cell_data.push(row_data);
+    }
+
+    for r_idx in 0..actual_rows {
+        // Now create a record of string slices from the owned Strings
+        let record: Vec<&str> = (0..actual_cols)
+            .map(|c_idx| all_cell_data[r_idx][c_idx].as_str())
             .collect();
         wtr.write_record(&record)?;
     }
@@ -1162,7 +1719,7 @@ fn load_csv(app: &mut App, path: &str) -> Result<(), Box<dyn std::error::Error>>
         app.cells = vec![
             vec![
                 Cell {
-                    content: "".to_string()
+                    value: CellValue::Text("".to_string())
                 };
                 1
             ];
@@ -1177,7 +1734,7 @@ fn load_csv(app: &mut App, path: &str) -> Result<(), Box<dyn std::error::Error>>
         app.cells = vec![
             vec![
                 Cell {
-                    content: "".to_string()
+                    value: CellValue::Text("".to_string())
                 };
                 app.cols
             ];
@@ -1186,9 +1743,13 @@ fn load_csv(app: &mut App, path: &str) -> Result<(), Box<dyn std::error::Error>>
 
         for (r, row_data) in records_data.iter().enumerate() {
             for (c, field_content) in row_data.iter().enumerate() {
-                // These checks should be fine as dimensions are now based on CSV
                 if r < app.rows && c < app.cols {
-                    app.cells[r][c].content = field_content.clone();
+                    // Try to parse as number, else store as text
+                    if let Ok(num) = field_content.trim().parse::<f64>() {
+                        app.cells[r][c].value = CellValue::Number(num);
+                    } else {
+                        app.cells[r][c].value = CellValue::Text(field_content.clone());
+                    }
                 }
             }
         }
@@ -1255,6 +1816,16 @@ fn run_app<B: ratatui::backend::Backend>(
                 return; // Skip the rest of the drawing if help popup is active
             }
 
+            // Create cell_map for formula evaluation, once per draw call
+            let mut cell_map_for_eval: HashMap<(usize, usize), &CellValue> = HashMap::new();
+            if app.rows > 0 && app.cols > 0 {
+                for (r_idx, row_vec) in app.cells.iter().enumerate() {
+                    for (c_idx, cell_obj) in row_vec.iter().enumerate() {
+                        cell_map_for_eval.insert((r_idx, c_idx), &cell_obj.value);
+                    }
+                }
+            }
+
             // Main application layout (spreadsheet, inspector, command bar)
             // Adjust view_rows for the new inspector bar and command bar
             app.view_rows = (size.height as usize).saturating_sub(3);
@@ -1288,46 +1859,65 @@ fn run_app<B: ratatui::backend::Backend>(
             app.view_rows = (main_area.height as usize).saturating_sub(3); // -1 for header row
 
             let mut lines = vec![];
-            let header = String::new();
+            // Helper function to convert 0-indexed column number to Excel-style string (A, B, ..., Z, AA, etc.)
+            // This function should be defined in an accessible scope, e.g., within main.rs.
+            #[allow(dead_code)] // Remove if used, or ensure it's used.
+            fn to_excel_col(idx: usize) -> String {
+                let mut temp_idx = idx;
+                let mut name = String::new();
+                loop {
+                    name.insert(0, (b'A' + (temp_idx % 26) as u8) as char);
+                    if temp_idx < 26 {
+                        break;
+                    }
+                    temp_idx = temp_idx / 26 - 1;
+                }
+                name
+            }
+
+            // Create header spans
             let mut header_spans: Vec<Span> = Vec::new();
-            // Add empty span for the space above row numbers
-            header_spans.push(Span::raw(format!("{:width$}", " ", width = number_width)));
+            // Add an empty span for the row number column, matching number_width
+            header_spans.push(Span::styled(
+                format!("{:width$}", "", width = number_width),
+                Style::default(), // This corner piece doesn't get highlighted by column selection
+            ));
 
-            for c_idx in app.scroll_col..(app.scroll_col + app.view_cols).min(app.cols) {
-                let mut is_highlighted = false;
+            for c in app.scroll_col..(app.scroll_col + app.view_cols).min(app.cols) {
+                let col_name = to_excel_col(c);
+                // Center the column name within app.cwidth, add 1 space padding on each side
+                let header_text = format!(" {:^width$} ", col_name, width = app.cwidth);
 
-                // Check if the cursor is in the current column
-                if c_idx == app.cursor_col {
-                    is_highlighted = true;
+                let mut is_col_highlighted = false;
+
+                // Check if the current column `c` is the cursor's column
+                if app.cursor_col == c {
+                    is_col_highlighted = true;
                 }
 
-                // Check if the current column is part of a visual selection's column range
-                if !is_highlighted { // Only check if not already highlighted by the cursor
-                    if let Some(((_r1, sel_c1), (_r2, sel_c2))) = app.selected_range() {
-                        // app.selected_range() provides the correct column bounds (sel_c1, sel_c2)
-                        // based on the current visual mode (VisualRow, VisualColumn, VisualBlock).
-                        // For VisualRow, sel_c1 will be 0 and sel_c2 will be app.cols - 1,
-                        // effectively highlighting all column headers.
-                        if c_idx >= sel_c1 && c_idx <= sel_c2 {
-                            is_highlighted = true;
+                // Check if the current column `c` is within the selected range's columns
+                if !is_col_highlighted { // Only check if not already highlighted by cursor
+                    if let Some(((_sel_r1, sel_c1), (_sel_r2, sel_c2))) = app.selected_range() {
+                        if c >= sel_c1 && c <= sel_c2 {
+                            is_col_highlighted = true;
                         }
                     }
                 }
 
-                let col_text = format!("{:<width$}", c_idx, width = app.cwidth + 2);
-                let style = if is_highlighted {
-                    Style::default().add_modifier(Modifier::REVERSED) // Style for highlighted header
+                let header_style = if is_col_highlighted {
+                    Style::default().add_modifier(Modifier::REVERSED) // Highlight style
                 } else {
-                    Style::default() // Default style for non-highlighted header
+                    Style::default() // Default style
                 };
-                header_spans.push(Span::styled(col_text, style));
+
+                header_spans.push(Span::styled(header_text, header_style));
             }
             lines.push(Line::from(header_spans));
 
             for r in app.scroll_row..(app.scroll_row + app.view_rows).min(app.rows) {
                 let mut row_spans: Vec<Span> = Vec::new();
-                let mut is_row_highlighted = false;
                 // Highlight if cursor is on this row
+                let mut is_row_highlighted = false;
                 if r == app.cursor_row {
                     is_row_highlighted = true;
                 }
@@ -1343,84 +1933,164 @@ fn run_app<B: ratatui::backend::Backend>(
 
                 let row_number_text = format!("{:width$}", r, width = number_width);
                 let row_number_style = if is_row_highlighted {
-                    Style::default().add_modifier(Modifier::REVERSED) // Style for highlighted row number
+                    Style::default().add_modifier(Modifier::REVERSED)
                 } else {
-                    Style::default() // Default style for non-highlighted row number
+                    Style::default()
                 };
                 row_spans.push(Span::styled(row_number_text, row_number_style));
 
-
                 for c in app.scroll_col..(app.scroll_col + app.view_cols).min(app.cols) {
-                    // Get cell content, truncate, and center it
-                    let original_content = if r < app.rows && c < app.cols {
-                        app.cells[r][c].content.clone()
+                    let (mut display_text, mut base_style, is_formula) = if r < app.rows && c < app.cols {
+                        let cell = &app.cells[r][c];
+                        match &cell.value {
+                            CellValue::Formula(expr_str) => {
+                                let mut formula_display = "ƒ".to_string();
+                                if let Some(expr) = parse_expr(expr_str) {
+                                    let mut visited = HashSet::new();
+                                    let eval_result = eval_expr(&expr, &cell_map_for_eval, &mut visited);
+                                    if eval_result.is_nan() {
+                                        formula_display.push_str("#DIV/0!");
+                                        (formula_display, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD), true)
+                                    } else if eval_result.is_infinite() {
+                                        formula_display.push_str("#INF!");
+                                        (formula_display, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD), true)
+                                    } else {
+                                        formula_display.push_str(&format!("{:.2}", eval_result));
+                                        (formula_display, Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC), true)
+                                    }
+                                } else {
+                                    formula_display.push_str("#P_ERR");
+                                    (formula_display, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD), true)
+                                }
+                            }
+                            CellValue::Number(n) => (n.to_string(), Style::default().fg(Color::Cyan), false),
+                            CellValue::Text(s) => (s.clone(), Style::default(), false),
+                        }
                     } else {
-                        "".to_string()
+                        ("".to_string(), Style::default(), false)
                     };
 
-                    let truncated_content = original_content
-                        .chars()
-                        .take(app.cwidth)
-                        .collect::<String>();
-                    let centered_content =
-                        format!("{:^width$}", truncated_content, width = app.cwidth);
+                    // Truncate and center the display_text to app.cwidth
+                    let truncated = display_text.chars().take(app.cwidth).collect::<String>();
+                    let centered = format!("{:^width$}", truncated, width = app.cwidth);
+                    display_text = centered;
 
                     // Determine if the cell is the cursor or part of a selection
                     let is_cursor = r == app.cursor_row && c == app.cursor_col;
                     let is_selected = if let Some(((r1, c1), (r2, c2))) = app.selected_range() {
-                        // selected_range() already provides the correct bounding box for the current visual mode
                         r >= r1 && r <= r2 && c >= c1 && c <= c2
                     } else {
                         false
                     };
 
-                    let cell_text: String;
-                    let cell_style: Style;
-
-                    if is_cursor {
-                        cell_text = format!("[{}]", centered_content); // Keep brackets for cursor
-                        cell_style = Style::default().add_modifier(Modifier::REVERSED); // Use reverse video for cursor
-                    } else if is_selected {
-                        cell_text = format!(" {centered_content} "); // Keep asterisks or use spaces
-                        // Style for selected cells (e.g., background color)
-                        cell_style = Style::default().bg(Color::DarkGray); // Example: Dark gray background
-                    // Consider adding .fg(Color::White) if needed for contrast
-                    } else {
-                        cell_text = format!(" {} ", centered_content); // Spaces for normal cells
-                        cell_style = Style::default(); // Default style for normal cells
+                    let mut final_style = base_style;
+                    if is_formula {
+                        final_style = final_style.fg(Color::Yellow);
                     }
-                    row_spans.push(Span::styled(cell_text, cell_style));
+                    if is_cursor {
+                        final_style = final_style.add_modifier(Modifier::REVERSED);
+                    } else if is_selected {
+                        final_style = final_style.bg(Color::DarkGray);
+                    }
+
+                    // Always pad to fixed width (cwidth+2 for borders/padding)
+                    let cell_text = if is_cursor {
+                        // Show brackets for cursor cell, but keep width fixed
+                        let inner = display_text.trim();
+                        let pad = app.cwidth.saturating_sub(inner.len());
+                        let left = pad / 2;
+                        let right = pad - left;
+                        format!(
+                            "[{}{}{}]",
+                            " ".repeat(left),
+                            inner,
+                            " ".repeat(right)
+                        )
+                        .chars()
+                        .take(app.cwidth + 2)
+                        .collect::<String>()
+                    } else {
+                        // Normal/selected cell: pad with spaces to cwidth+2
+                        format!(" {} ", display_text)
+                            .chars()
+                            .take(app.cwidth + 2)
+                            .collect::<String>()
+                    };
+
+                    row_spans.push(Span::styled(cell_text, final_style));
                 }
                 lines.push(Line::from(row_spans));
             }
 
-                        let title = if let Some(path) = &app.filepath {
-                            format!("Spreadsheet - {}", path.file_name().unwrap_or_default().to_string_lossy())
-                        } else {
-                            "Spreadsheet".to_string()
-                        };
-                        let sheet_block = Block::default().title(title).borders(Borders::ALL);
-                        f.render_widget(Paragraph::new(lines).block(sheet_block), main_area);
+            let title = if let Some(path) = &app.filepath {
+                format!("Spreadsheet - {}", path.file_name().unwrap_or_default().to_string_lossy())
+            } else {
+                "Spreadsheet".to_string()
+            };
+            let sheet_block = Block::default().title(title).borders(Borders::ALL);
+            f.render_widget(Paragraph::new(lines).block(sheet_block), main_area);
 
 
             // Inspector Bar
-            let current_cell_content = if app.rows > 0 && app.cols > 0 {
-                &app.cells[app.cursor_row.min(app.rows - 1)][app.cursor_col.min(app.cols - 1)]
-                    .content
+            let (current_cell_content, inspector_formula_info) = if app.rows > 0 && app.cols > 0 {
+                let cell = &app.cells[app.cursor_row.min(app.rows - 1)][app.cursor_col.min(app.cols - 1)];
+                match &cell.value {
+                    CellValue::Formula(expr_str) => {
+                        // Use native evaluator
+                        let mut cell_map: HashMap<(usize, usize), &CellValue> = HashMap::new();
+                        for (r_idx, row_vec) in app.cells.iter().enumerate() {
+                            for (c_idx, cell_val) in row_vec.iter().enumerate() {
+                                cell_map.insert((r_idx, c_idx), &cell_val.value);
+                            }
+                        }
+                        if let Some(expr) = parse_expr(expr_str) {
+                            let mut visited = std::collections::HashSet::new();
+                            let eval_result = eval_expr(&expr, &cell_map, &mut visited);
+                            let value_str = format!("{:.4}", eval_result);
+                            (format!("={}", expr_str), Some(format!("= {} → {}", expr_str, value_str)))
+                        } else {
+                            (format!("={}", expr_str), Some("#PARSE_ERR".to_string()))
+                        }
+                    }
+                    _ => (cell.to_content(), None),
+                }
             } else {
-                "N/A"
+                ("N/A".to_string(), None)
             };
-            let inspector_text = format!(
-                "Cell ({}, {}): \"{}\" | Size: {}Rx{}C",
-                app.cursor_row, app.cursor_col, current_cell_content, app.rows, app.cols,
-            );
+            let inspector_text = if let Some(formula_info) = inspector_formula_info {
+                format!(
+                    "Cell ({}, {}): {} | {} | Size: {}Rx{}C",
+                    app.cursor_row, app.cursor_col, current_cell_content, formula_info, app.rows, app.cols,
+                )
+            } else {
+                format!(
+                    "Cell ({}, {}): \"{}\" | Size: {}Rx{}C",
+                    app.cursor_row, app.cursor_col, current_cell_content, app.rows, app.cols,
+                )
+            };
             let inspector_paragraph = Paragraph::new(inspector_text);
             f.render_widget(inspector_paragraph, inspector_area);
 
             // Footer / Command Bar
             let footer_text = match app.mode {
-                Mode::Command => format!(":{}", app.input),
-                Mode::Insert => format!("INSERT {}", app.input),
+                Mode::Command => {
+                    // Show the input and set the terminal cursor position
+                    let cursor_pos = app.input.len();
+                    let prompt_len = 1; // ":" prompt
+                    let x = footer_area.x + prompt_len as u16 + cursor_pos as u16;
+                    let y = footer_area.y;
+                    f.set_cursor(x, y);
+                    format!(":{}", app.input)
+                }
+                Mode::Insert => {
+                    // Show the input and set the terminal cursor position
+                    let cursor_pos = app.insert_mode_cursor.min(app.input.len());
+                    let prompt_len = "INSERT ".len();
+                    let x = footer_area.x + prompt_len as u16 + cursor_pos as u16;
+                    let y = footer_area.y;
+                    f.set_cursor(x, y);
+                    format!("INSERT {}", app.input)
+                }
                 Mode::Normal => format!("-- NORMAL --  {}", app.command_msg),
                 Mode::VisualRow => "-- VISUAL LINE --".into(),
                 Mode::VisualBlock => "-- VISUAL BLOCK --".into(),
@@ -1522,9 +2192,17 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
                 } else {
-                    // Existing key handling logic when help and popup_menu are not shown
                     match app.mode {
                         Mode::Normal => match key.code {
+                            // f to insert formula
+                            KeyCode::Char('f') if key.modifiers.is_empty() => {
+                                app.mode = Mode::Insert;
+                                app.input = "=".to_string();
+                                app.command_msg = "Formula mode: type your formula and press Enter".to_string();
+                                // set cursor to end of input
+                                app.insert_mode_cursor = app.input.len();
+
+                            }
                             KeyCode::Char(',') if key.modifiers.is_empty() => {
                                 // restore selection range
                                 if let Some((start_coords, end_coords)) = app.last_selection_range {
@@ -1550,7 +2228,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.cursor_row = app.rows.saturating_sub(1);
                             }
                             KeyCode::Char('h') if key.modifiers.is_empty() => {
-                                app.cursor_col = app.cursor_col.saturating_sub(1)
+                                app.cursor_col = app.cursor_col.saturating_sub(1);
                             }
                             KeyCode::Char('H') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                                 // moves cell to the left
@@ -1561,15 +2239,15 @@ fn run_app<B: ratatui::backend::Backend>(
                                     let left_cell = &mut left[app.cursor_col - 1];
                                     let current_cell = &mut right[0];
                                     std::mem::swap(
-                                        &mut left_cell.content,
-                                        &mut current_cell.content,
+                                        &mut left_cell.value,
+                                        &mut current_cell.value,
                                     );
                                     app.cursor_col -= 1;
                                 }
                             }
                             KeyCode::Char('l') => {
-                                app.cursor_col = (app.cursor_col + 1).min(app.cols - 1)
-                            }
+                                app.cursor_col = (app.cursor_col + 1).min(app.cols - 1);
+}
                             KeyCode::Char('L') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                                 // moves cell to the right
                                 if app.cursor_col < app.cols - 1 {
@@ -1579,11 +2257,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                     let current_cell = &mut left[app.cursor_col];
                                     let right_cell = &mut right[0];
                                     std::mem::swap(
-                                        &mut current_cell.content,
-                                        &mut right_cell.content,
+                                        &mut current_cell.value,
+                                        &mut right_cell.value,
                                     );
                                     app.cursor_col += 1;
-                                }
+                            }
                             }
                             KeyCode::Char('0') => app.cursor_col = 0,
                             KeyCode::Char('$') => app.cursor_col = app.cols,
@@ -1597,14 +2275,14 @@ fn run_app<B: ratatui::backend::Backend>(
                                         &mut above[app.cursor_row - 1][app.cursor_col];
                                     let below_cell = &mut below[0][app.cursor_col];
                                     std::mem::swap(
-                                        &mut current_cell.content,
-                                        &mut below_cell.content,
+                                        &mut current_cell.value,
+                                        &mut below_cell.value,
                                     );
                                     app.cursor_row -= 1;
                                 }
                             }
                             KeyCode::Char('j') => {
-                                app.cursor_row = (app.cursor_row + 1).min(app.rows - 1)
+                                app.cursor_row = (app.cursor_row + 1).min(app.rows - 1);
                             }
                             KeyCode::Char('J') => {
                                 // moves cell down
@@ -1614,8 +2292,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                     let current_cell = &mut above[app.cursor_row][app.cursor_col];
                                     let below_cell = &mut below[0][app.cursor_col];
                                     std::mem::swap(
-                                        &mut current_cell.content,
-                                        &mut below_cell.content,
+                                        &mut current_cell.value,
+                                        &mut below_cell.value,
                                     );
                                     app.cursor_row += 1;
                                 }
@@ -1643,7 +2321,8 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('i') => {
                                 app.mode = Mode::Insert;
                                 app.input =
-                                    app.cells[app.cursor_row][app.cursor_col].content.clone();
+                                    app.cells[app.cursor_row][app.cursor_col].to_content();
+                                app.insert_mode_cursor = app.input.len();
                             }
                             KeyCode::Char('u') => app.undo(),
                             KeyCode::Char('U') => app.redo(),
@@ -1665,8 +2344,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                             let r = app.cursor_row + dr;
                                             let c = app.cursor_col + dc;
                                             if r < app.rows && c < app.cols {
-                                                app.cells[r][c].content =
-                                                    app.clipboard[dr][dc].content.clone();
+                                                app.cells[r][c].value =
+                                                    app.clipboard[dr][dc].value.clone();
                                             }
                                         }
                                     }
@@ -1676,13 +2355,14 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.snapshot();
                                 app.mode = Mode::Insert;
                                 app.input.clear();
-                                app.cells[app.cursor_row][app.cursor_col].content.clear();
+                                app.cells[app.cursor_row][app.cursor_col].value = CellValue::Text("".to_string());
+                                app.input = app.cells[app.cursor_row][app.cursor_col].to_content();
                             }
                             KeyCode::Char('d') => {
                                 app.snapshot();
                                 app.clipboard =
                                     vec![vec![app.cells[app.cursor_row][app.cursor_col].clone()]];
-                                app.cells[app.cursor_row][app.cursor_col].content.clear();
+                                app.cells[app.cursor_row][app.cursor_col].value = CellValue::Text("".to_string());
                             }
                             KeyCode::Char('<') => {
                                 app.snapshot();
@@ -1744,19 +2424,31 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Esc => app.mode = Mode::Normal,
                             KeyCode::Enter => {
                                 app.snapshot();
-                                app.cells[app.cursor_row][app.cursor_col].content =
-                                    app.input.clone();
+                                let input = app.input.clone();
+                                let cell = if input.starts_with('=') {
+                                    Cell { value: CellValue::Formula(input[1..].to_string()) }
+                                } else if let Ok(n) = input.parse::<f64>() {
+                                    Cell { value: CellValue::Number(n) }
+                                } else {
+                                    Cell { value: CellValue::Text(input) }
+                                };
+                                app.cells[app.cursor_row][app.cursor_col] = cell;
                                 app.input.clear();
                                 app.mode = Mode::Normal;
+                                app.command_msg.clear();
                             }
                             KeyCode::Backspace => {
                                 app.input.pop();
                             }
-
                             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 app.input.clear();
                             }
-                            KeyCode::Char(c) => app.input.push(c),
+                            KeyCode::Char(c) => {
+                                // Insert at the current cursor position in insert mode
+                                let pos = app.insert_mode_cursor.min(app.input.len());
+                                app.input.insert(pos, c);
+                                app.insert_mode_cursor += 1;
+                            },
                             _ => {}
                         },
                         Mode::Command => match key.code {
@@ -1798,9 +2490,21 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.mode = Mode::Normal;
                                 app.visual_start = None;
                             }
-                            KeyCode::Char(c) => app.input.push(c),
+                            KeyCode::Char(c) => {
+                                // Insert at the current cursor position in insert mode
+                                let pos = app.insert_mode_cursor.min(app.input.len());
+                                app.input.insert(pos, c);
+                                app.insert_mode_cursor += 1;
+                            },
                             KeyCode::Backspace => {
                                 app.input.pop();
+                                // if its empty go back to normal mode
+                                if app.input.is_empty() {
+                                    app.mode = Mode::Normal;
+                                    app.visual_start = None;
+                                    app.command_history_index = None; // Reset history navigation
+                                    app.current_command_input_buffer.clear();
+                                }
                             }
                             KeyCode::Up => {
                                 if app.command_history.is_empty() {
@@ -1911,7 +2615,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                         completed_input.push('/');
                                                     }
                                                     app.input = completed_input;
-                                                    app.popup_menu = None; // No need for popup if only one exact match that's already typed
+                                                    app.popup_menu = None;
                                                 } else {
                                                     app.popup_menu = Some(PopupMenu::new(
                                                         "Suggestions".to_string(),
@@ -2010,8 +2714,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                                     // Use split_at_mut to get two non-overlapping mutable references
                                                     let (left, right) = row.split_at_mut(c);
                                                     std::mem::swap(
-                                                        &mut left[c - 1].content,
-                                                        &mut right[0].content,
+                                                        &mut left[c - 1].value,
+                                                        &mut right[0].value,
                                                     );
                                                 }
                                             }
@@ -2052,8 +2756,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                                 let current_row = &mut bottom[0];
                                                 for c in c1..=c2 {
                                                     std::mem::swap(
-                                                        &mut above_row[c].content,
-                                                        &mut current_row[c].content,
+                                                        &mut above_row[c].value,
+                                                        &mut current_row[c].value,
                                                     );
                                                 }
                                             }
@@ -2075,8 +2779,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                                 let below_row = &mut bottom[0];
                                                 for c in c1..=c2 {
                                                     std::mem::swap(
-                                                        &mut current_row[c].content,
-                                                        &mut below_row[c].content,
+                                                        &mut current_row[c].value,
+                                                        &mut below_row[c].value,
                                                     );
                                                 }
                                             }
@@ -2110,9 +2814,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                                 if dr < app.clipboard.len() {
                                                     for (dc, c) in (c1..=c2).enumerate() {
                                                         if dc < app.clipboard[dr].len() {
-                                                            app.cells[r][c].content = app.clipboard
+                                                            app.cells[r][c].value = app.clipboard
                                                                 [dr][dc]
-                                                                .content
+                                                                .value
                                                                 .clone();
                                                         }
                                                     }
@@ -2123,8 +2827,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                         } else if !app.clipboard.is_empty()
                                             && !app.clipboard[0].is_empty()
                                         {
-                                            app.cells[app.cursor_row][app.cursor_col].content =
-                                                app.clipboard[0][0].content.clone();
+                                            app.cells[app.cursor_row][app.cursor_col].value =
+                                                app.clipboard[0][0].value.clone();
                                         }
                                     }
                                 }
@@ -2137,18 +2841,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                             let mut row_clip = Vec::new();
                                             for c in c1..=c2 {
                                                 row_clip.push(app.cells[r][c].clone());
-                                                app.cells[r][c].content.clear();
+                                                app.cells[r][c].value = CellValue::Text("".to_string());
                                             }
                                             app.clipboard.push(row_clip);
                                         }
                                         app.mode = Mode::Normal;
-                                        app.visual_start = None;
+                                      app.visual_start = None;
                                     } else {
                                         // Copy single cell to clipboard
                                         app.clipboard = vec![vec![
                                             app.cells[app.cursor_row][app.cursor_col].clone(),
                                         ]];
-                                        app.cells[app.cursor_row][app.cursor_col].content.clear();
+                                        app.cells[app.cursor_row][app.cursor_col].value = CellValue::Text("".to_string());
                                     }
                                 }
                                 _ => {}
@@ -2254,7 +2958,7 @@ impl SelectionCommand for UppercaseCommand {
     ) -> Result<String, String> {
         for r in r1..=r2 {
             for c in c1..=c2 {
-                app.cells[r][c].content = app.cells[r][c].content.to_uppercase();
+                app.cells[r][c].value = CellValue::Text(app.cells[r][c].to_content().to_uppercase());
             }
         }
         Ok("Converted selection to uppercase.".to_string())
@@ -2278,7 +2982,7 @@ impl SelectionCommand for LowercaseCommand {
     ) -> Result<String, String> {
         for r in r1..=r2 {
             for c in c1..=c2 {
-                app.cells[r][c].content = app.cells[r][c].content.to_lowercase();
+                app.cells[r][c].value = CellValue::Text(app.cells[r][c].to_content().to_lowercase());
             }
         }
         Ok("Converted selection to lowercase.".to_string())
@@ -2300,18 +3004,45 @@ impl SelectionCommand for SumCommand {
         r2: usize,
         c2: usize,
     ) -> Result<String, String> {
+        use crate::CellValue::*;
+        use crate::parse_expr;
+        use crate::eval_expr;
+        use std::collections::HashMap;
         let mut sum = 0.0;
         let mut count = 0;
+        // Build cell map for formula evaluation
+        let mut cell_map: HashMap<(usize, usize), &CellValue> = HashMap::new();
+        for (r_idx, row_vec) in app.cells.iter().enumerate() {
+            for (c_idx, cell_val) in row_vec.iter().enumerate() {
+                cell_map.insert((r_idx, c_idx), &cell_val.value);
+            }
+        }
         for r in r1..=r2 {
             for c in c1..=c2 {
-                if let Ok(val) = app.cells[r][c].content.trim().parse::<f64>() {
-                    sum += val;
-                    count += 1;
+                match &app.cells[r][c].value {
+                    Number(n) => {
+                        sum += *n;
+                        count += 1;
+                    }
+                    Formula(expr_str) => {
+                        if let Some(expr) = parse_expr(expr_str) {
+                            let mut visited = std::collections::HashSet::new();
+                            let val = eval_expr(&expr, &cell_map, &mut visited);
+                            sum += val;
+                            count += 1;
+                        }
+                    }
+                    Text(s) => {
+                        if let Ok(n) = s.trim().parse::<f64>() {
+                            sum += n;
+                            count += 1;
+                        }
+                    }
                 }
             }
         }
         if count == 0 {
-            Err("No numeric values in selection.".to_string())
+            Err("No numeric or formula values in selection.".to_string())
         } else {
             Ok(format!("Sum: {}", sum))
         }
@@ -2333,18 +3064,45 @@ impl SelectionCommand for AverageCommand {
         r2: usize,
         c2: usize,
     ) -> Result<String, String> {
+        use crate::CellValue::*;
+        use crate::parse_expr;
+        use crate::eval_expr;
+        use std::collections::HashMap;
         let mut sum = 0.0;
         let mut count = 0;
+        // Build cell map for formula evaluation
+        let mut cell_map: HashMap<(usize, usize), &CellValue> = HashMap::new();
+        for (r_idx, row_vec) in app.cells.iter().enumerate() {
+            for (c_idx, cell_val) in row_vec.iter().enumerate() {
+                cell_map.insert((r_idx, c_idx), &cell_val.value);
+            }
+        }
         for r in r1..=r2 {
             for c in c1..=c2 {
-                if let Ok(val) = app.cells[r][c].content.trim().parse::<f64>() {
-                    sum += val;
-                    count += 1;
+                match &app.cells[r][c].value {
+                    Number(n) => {
+                        sum += *n;
+                        count += 1;
+                    }
+                    Formula(expr_str) => {
+                        if let Some(expr) = parse_expr(expr_str) {
+                            let mut visited = std::collections::HashSet::new();
+                            let val = eval_expr(&expr, &cell_map, &mut visited);
+                            sum += val;
+                            count += 1;
+                        }
+                    }
+                    Text(s) => {
+                        if let Ok(n) = s.trim().parse::<f64>() {
+                            sum += n;
+                            count += 1;
+                        }
+                    }
                 }
             }
         }
         if count == 0 {
-            Err("No numeric values in selection.".to_string())
+            Err("No numeric or formula values in selection.".to_string())
         } else {
             Ok(format!("Average: {}", sum / count as f64))
         }
@@ -2364,91 +3122,121 @@ fn get_selection_command(name: &str) -> Option<Box<dyn SelectionCommand>> {
 // Add a help message constant for the help popup
 const HELP_MESSAGE: &str = r#"Spreadsheet TUI Help
 
-Navigation:
-    h/j/k/l         Move left/down/up/right
-    H/J/K/L         Move cell left/down/up/right (swap)
-    0/$             Move to first/last column
-    g/G             Jump to first/last row
-    V               Start visual row selection
-    v               Start visual block selection
-    Ctrl+v          Start visual column selection
-    Esc             Exit visual/insert/command mode
+General:
+    Ctrl+q          Quit application immediately
+    Esc             Exit visual/insert/command mode, or close popups
 
-Editing:
-    i               Edit cell (insert mode)
-    c               Clear cell and enter insert mode
-    d               Delete cell or selection (copies to clipboard)
-    y               Yank (copy) cell or selection
-    p               Paste clipboard at cursor or selection
+Navigation (Normal Mode):
+    h/j/k/l         Move cursor left/down/up/right
+    0/$             Move cursor to first/last column of the current row
+    g/G             Jump cursor to the first/last row of the sheet
+    w/e             Page view left/right (cursor moves to start of new view)
+    t/b             Page view up/down (cursor moves to start of new view)
+    ,               Restore last visual selection (re-enters visual mode)
+
+Editing (Normal Mode):
+    i               Enter Insert mode to edit current cell (pre-fills with cell content)
+    f               Enter Insert mode to edit current cell as a formula (pre-fills with '=')
+    c               Clear current cell content and enter Insert mode
+    d               Delete current cell content (copies to clipboard)
+    y               Yank (copy) current cell content to clipboard
+    p               Paste clipboard content starting at cursor (can paste multiple cells)
+    H/J/K/L         Move current cell content left/down/up/right by swapping with adjacent cell
+
+Visual Mode (Enter with V, v, Ctrl+v from Normal Mode):
+    V               Enter Visual Row selection mode
+    v               Enter Visual Block selection mode
+    Ctrl+v          Enter Visual Column selection mode
+
+    In Visual Mode:
+    h/j/k/l         Adjust selection boundary
+    H/J/K/L         Move entire selected block of cells left/down/up/right
+    y               Yank (copy) selected cells to clipboard
+    d               Delete selected cells (copies to clipboard) and clear their content
+    p               Paste clipboard content into the selected region
+    :               Enter Command mode to operate on selection (e.g., :sum, :sort)
+    Esc             Exit Visual mode, return to Normal mode
+    V/v/b/c         Switch between Visual Row (V), Visual Block (v or b), Visual Column (c or Ctrl+v)
+
+Insert Mode (Enter with i, f, c from Normal Mode):
+    Type to edit cell content.
+    Enter           Save changes to cell and return to Normal mode
+    Esc             Discard changes and return to Normal mode
+    Backspace       Delete character before cursor
+    Ctrl+u          Clear entire input line
+    (Arrow keys for cursor movement within input are not supported)
+
+Command Mode (Enter with : from Normal or Visual Mode):
+    Type command and press Enter. Esc to cancel.
+    Up/Down         Navigate command history
+    Tab             Attempt path completion for :load, :save, :w, :wq
+
+    Commands:
+    :q              Quit
+    :w [<file>]     Write (save) sheet to CSV. Uses current filepath if <file> omitted.
+    :wq [<file>]    Write (save) sheet and quit.
+    :save <file>    Save sheet to <file> as CSV.
+    :load <file>    Load sheet from <file>.csv.
+    :files          Show files in current directory (popup).
+    :help           Show this help message (popup).
+    :goto <r>[:<c>] Jump cursor to row <r> and optional column <c> (0-indexed).
+    :r <row>        Jump cursor to <row> (0-indexed).
+    :c <col>        Jump cursor to <col> (0-indexed).
+    :clear          Clear all cells in the sheet.
+    :undo           Undo last action.
+    :redo           Redo last undone action.
+    :num / :number  Convert text cells to numbers if parseable. Formulas/numbers unchanged.
+    :fill [content] Fill selection. Uses [content] if provided. If no content, uses the
+                    first cell of the clipboard.
+    :new (r|c|rc) [N] Insert N (default 1) new row(s) at cursor/selection (r=row, c=col, rc=both).
+    :delete (r|c|rc) Delete row(s)/column(s) at cursor/selection.
+
+    Selection Commands (typically used from Visual Mode with :):
+    :uppercase      Convert text in selection to uppercase.
+    :lowercase      Convert text in selection to lowercase.
+    :sum            Calculate sum of numeric values in selection (displays in command message).
+    :average        Calculate average of numeric values in selection (displays in command message).
+    :sort [flags]   Sort selected cells. Behavior depends on Visual Mode:
+                    - Visual Row/Block: Sorts rows within the selection.
+                    - Visual Column: Sorts all rows of the sheet based on the selected columns.
+      Flags:
+        n,num,numeric   Sort numerically (default).
+        s,str,string    Sort as strings.
+        l,len,length    Sort by content length.
+        <,asc           Ascending order (default).
+        >,desc          Descending order.
+        e,ext,extended  Extended sort:
+                        - Visual Row/Block: Moves the entire content of selected rows.
+                        - Visual Column: Sorts all rows of the sheet based on the key column.
+
+Formulas:
+    Start cell content with '=' (e.g., in Insert mode or via 'f' key).
+    Example: =A1+B2 or =(A1+B2)*C3
+    Supported:
+      Operators: +, -, *, / and parentheses ().
+      Cell Refs: A1, B10 (0-indexed internally, e.g. A0 is (0,0)).
+      Ranges: A1:C5 (e.g., for SUM).
+      Functions: SUM(range), AVERAGE(args), COUNT(args), MAX(args), MIN(args).
+                 Arguments can be numbers, cell refs, or ranges.
+    Evaluation:
+      Non-numeric cells or cells with errors referenced in formulas are often treated as 0.0
+      or may result in NaN (Not a Number), affecting calculations.
+      Circular references result in NaN.
+      Inspector bar (below sheet) shows the current cell's raw content and, if a formula,
+      its evaluated result (e.g., =A1+B1 → 15.0).
+      Errors like #DIV/0!, #INF!, #P_ERR (parse error) may appear.
 
 Undo/Redo:
-    u               Undo
-    U               Redo
+    u               Undo last action (Normal mode)
+    U               Redo last undone action (Normal mode, Shift+u)
 
 Column Width:
-    < / >           Decrease/increase column width
+    < / >           Decrease/increase display width of all columns (Normal mode)
 
-Command Mode:
-    :               Enter command mode
-    :w <file>       Save as CSV
-    :q              Quit
-    :wq <file>      Save and quit
-    :load <file>    Load CSV file
-    :save <file>    Save as CSV
-    :files          Show files in current directory
-    :help           Show this help
-    :goto <r> [: <c>] Jump to specific row/column
-    :clear          Clear all cells
-    :undo           Undo last action
-    :redo           Redo last action
-
-Selection Commands:
-    :uppercase      Convert selection to uppercase
-    :lowercase      Convert selection to lowercase
-    :sum            Calculate sum of numeric values in selection
-    :average        Calculate average of numeric values in selection
-
-Sort:
-    In visual mode, use :sort [flags]
-    Flags:
-        n, num, numeric     Sort numerically (default)
-        s, str, string      Sort as strings
-        l, len, length      Sort by content length
-        <, asc             Ascending order (default)
-        >, desc            Descending order
-        e, ext, extended    Sort entire rows based on selected cells
-
-Visual Mode:
-    Move selection with h/j/k/l
-    Move entire selection with H/J/K/L
-    Apply commands with : (e.g., :sort, :uppercase)
-    Switch between visual modes with V (row), v (block), c (column), b (block)
-
-Other:
-    Tab completion for :load and :save commands
+Help Popup Navigation:
+    j/k             Scroll down/up
+    g               Scroll to top
+    Esc, q, h       Close help
 
 Press Esc, q, or h to close this help.
 "#;
-
-// Helper function to create a centered rectangle for the popup
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-// simple forth script engine to create formulas and attach to cells
