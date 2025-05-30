@@ -2214,6 +2214,55 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.cursor_row
                                 );
                             }
+                            // a/A should open new column right/left    
+                            KeyCode::Char('a') if key.modifiers.is_empty() => {
+                                app.snapshot();
+                                app.insert_col(app.cursor_col + 1);
+                                app.cursor_col += 1;
+                                app.command_msg = format!(
+                                    "New column inserted right of column {}",
+                                    app.cursor_col
+                                );
+                            }
+                            KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                app.snapshot();
+                                app.insert_col(app.cursor_col);
+                                app.command_msg = format!(
+                                    "New column inserted left of column {}",
+                                    app.cursor_col
+                                );
+                            }
+
+                            // D should delete row
+                            KeyCode::Char('D') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                let row_to_delete = app.cursor_row;
+                                if app.rows > 1 {
+                                    app.snapshot();
+                                    app.delete_row(row_to_delete);
+                                    app.command_msg = format!("Deleted row {}", row_to_delete);
+                                    // Adjust cursor position if needed
+                                    if app.cursor_row >= app.rows {
+                                        app.cursor_row = app.rows.saturating_sub(1);
+                                    }
+                                } else {
+                                    app.command_msg = "Cannot delete the last row.".to_string();
+                                }
+                            }
+                            // ctrl + d should delete column
+                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let col_to_delete = app.cursor_col;
+                                if app.cols > 1 {
+                                    app.snapshot();
+                                    app.delete_col(col_to_delete);
+                                    app.command_msg = format!("Deleted column {}", col_to_delete);
+                                    // Adjust cursor position if needed
+                                    if app.cursor_col >= app.cols {
+                                        app.cursor_col = app.cols.saturating_sub(1);
+                                    }
+                                } else {
+                                    app.command_msg = "Cannot delete the last column.".to_string();
+                                }
+                            }
                             // r for result into cell
                             KeyCode::Char('r') if key.modifiers.is_empty() => {
                                 if app.result.is_some() {
@@ -3201,6 +3250,12 @@ Editing (Normal Mode):
     f               Enter Insert mode to edit current cell as a formula (pre-fills with '=')
     c               Clear current cell content and enter Insert mode
     d               Delete current cell content (copies to clipboard)
+    D               Delete row
+    ctrl+d          Delete column
+    o               Insert new row below current row
+    O               Insert new row above current row
+    a               Append new column to the right of current column
+    A               Append new column to the left of current column
     y               Yank (copy) current cell content to clipboard
     p               Paste clipboard content starting at cursor (can paste multiple cells)
     H/J/K/L         Move current cell content left/down/up/right by swapping with adjacent cell
