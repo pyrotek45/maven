@@ -14,10 +14,9 @@ A fast, terminal-based spreadsheet for Linux, inspired by Vim and designed for p
 - **Inspector bar**: Shows cell content, location, and sheet info.
 - **Undo/redo**: `u`/`U` for unlimited undo/redo.
 - **Clipboard**: `y` (yank), `d` (delete/cut), `p` (paste).
-- **Sort**: Powerful, context-aware sorting with `:sort` or `s` in visual mode.
-- **Multiple tabs**: Work on several files at once (tab bar, `Tab` to switch).
+- **Sort**: Powerful, context-aware sorting.
 - **CSV support**: Load and save CSV files easily.
-- **Help popup**: `:help` or `?` for a full key/command reference.
+- **Help popup**: `:help` for a full key/command reference.
 
 ---
 
@@ -47,8 +46,6 @@ cargo run --release [optional.csv]
 | u/U            | Undo/Redo                              |
 | y/d/p          | Yank/Delete/Paste                      |
 | <, >           | Decrease/Increase column width         |
-| Tab            | Switch tab (normal mode)               |
-| s (visual)     | Sort selection (see below)             |
 | Esc            | Exit mode/selection/popup              |
 
 ---
@@ -93,14 +90,7 @@ Tab completion works for file paths in `:load` and `:save`.
 
 ## Tips
 
-- Use `:help` or `?` for a full key/command reference.
+- Use `:help` for a full key/command reference.
 - Undo/redo works for all actions.
 - Use tab completion for file paths.
 - Inspector bar shows current cell and sheet info.
-- Multiple files: open with `:tabnew <file>`, switch with `Tab`.
-
----
-
-## Contributing
-
-Pull requests and issues are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) if available.
