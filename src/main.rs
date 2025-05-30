@@ -416,7 +416,8 @@ struct App {
     filepath: Option<PathBuf>,             // Store the path of the currently loaded file
 
     last_selection_range: Option<((usize, usize), (usize, usize))>, // Last selected range for commands
-    insert_mode_cursor: usize
+    insert_mode_cursor: usize,
+    result: Option<f64>
 }
 
 impl App {
@@ -503,6 +504,7 @@ impl App {
             filepath: None,
             last_selection_range: None, // Initialize to None
             insert_mode_cursor: 0, // Initialize insert mode cursor position
+            result:None, // Initialize result to 0.0
         }
     }
     /// Take a snapshot of the current state for undo/redo.
@@ -2194,6 +2196,21 @@ fn run_app<B: ratatui::backend::Backend>(
                 } else {
                     match app.mode {
                         Mode::Normal => match key.code {
+                            // r for result into cell
+                            KeyCode::Char('r') if key.modifiers.is_empty() => {
+                                if app.result.is_some() {
+                                    app.snapshot();
+                                    let result = app.result.clone().unwrap();
+                                    app.cells[app.cursor_row][app.cursor_col].value =
+                                        CellValue::Number(result);
+                                    app.command_msg = format!(
+                                        "Result inserted into cell ({}, {})",
+                                        app.cursor_row, app.cursor_col
+                                    );
+                                } else {
+                                    app.command_msg = "No result to insert.".to_string();
+                                }
+                            }
                             // f to insert formula
                             KeyCode::Char('f') if key.modifiers.is_empty() => {
                                 app.mode = Mode::Insert;
@@ -2639,6 +2656,28 @@ fn run_app<B: ratatui::backend::Backend>(
                             app.visual_mode_for_command = Some(app.mode.clone());
 
                             match key.code {
+                                // r for result into selection region
+                                KeyCode::Char('r') if key.modifiers.is_empty() => {
+                                    if app.result.is_some() {
+                                        app.snapshot();
+                                        if let Some(((r1, c1), (r2, c2))) = app.selected_range() {
+                                            for r in r1..=r2 {
+                                                for c in c1..=c2 {
+                                                    app.cells[r][c].value =
+                                                        CellValue::Number(app.result.unwrap());
+                                                }
+                                            }
+                                            app.command_msg = format!(
+                                                "Result inserted into selection ({}, {}) to ({}, {})",
+                                                r1, c1, r2, c2
+                                            );
+                                        } else {
+                                            app.command_msg = "No selection to insert result.".to_string();
+                                        }
+                                    } else {
+                                        app.command_msg = "No result to insert.".to_string();
+                                    }
+                                }
                                 KeyCode::Char('v')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
@@ -3044,6 +3083,8 @@ impl SelectionCommand for SumCommand {
         if count == 0 {
             Err("No numeric or formula values in selection.".to_string())
         } else {
+            let result = sum;
+            app.result = Some(result);
             Ok(format!("Sum: {}", sum))
         }
     }
@@ -3104,7 +3145,9 @@ impl SelectionCommand for AverageCommand {
         if count == 0 {
             Err("No numeric or formula values in selection.".to_string())
         } else {
-            Ok(format!("Average: {}", sum / count as f64))
+            let result = sum / count as f64;
+            app.result = Some(result);
+            Ok(format!("Average: {}", result))
         }
     }
 }
@@ -3135,6 +3178,7 @@ Navigation (Normal Mode):
     ,               Restore last visual selection (re-enters visual mode)
 
 Editing (Normal Mode):
+    r               Enter Command mode to operate on current cell (e.g., :sum)
     i               Enter Insert mode to edit current cell (pre-fills with cell content)
     f               Enter Insert mode to edit current cell as a formula (pre-fills with '=')
     c               Clear current cell content and enter Insert mode
@@ -3147,7 +3191,7 @@ Visual Mode (Enter with V, v, Ctrl+v from Normal Mode):
     V               Enter Visual Row selection mode
     v               Enter Visual Block selection mode
     Ctrl+v          Enter Visual Column selection mode
-
+    r               Insert result into selected cells (if available)
     In Visual Mode:
     h/j/k/l         Adjust selection boundary
     H/J/K/L         Move entire selected block of cells left/down/up/right
