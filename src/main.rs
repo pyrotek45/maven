@@ -9,7 +9,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style}, // Keep Style, Color, Modifier as they are used in PopupMenu::draw indirectly
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph}, // Keep List, ListItem as they are used in PopupMenu::draw indirectly
 };
 use std::{
@@ -30,7 +30,6 @@ enum Mode {
     VisualRow,
     VisualColumn,
     VisualBlock,
-    Sort,
 }
 
 #[derive(Clone)]
@@ -74,6 +73,8 @@ struct App {
     tab_completion_command_prefix: String, // e.g., "load " or "save "
     tab_completion_path_prefix: String,    // e.g., "some/directory/"
     filepath: Option<PathBuf>,             // Store the path of the currently loaded file
+
+    last_selection_range: Option<((usize, usize), (usize, usize))>, // Last selected range for commands
 }
 
 impl App {
@@ -116,6 +117,7 @@ impl App {
             tab_completion_command_prefix: String::new(),
             tab_completion_path_prefix: String::new(),
             filepath: None,
+            last_selection_range: None, // Initialize to None
         }
     }
     /// Take a snapshot of the current state for undo/redo.
@@ -725,8 +727,7 @@ impl HelpPopup {
         let content_view = content_lines
             .iter()
             .skip(scroll_position)
-            .take(max_visible_lines)
-            .map(|&s| s) // Convert &str to String or use as is if Paragraph can handle Vec<Line>
+            .take(max_visible_lines).copied() // Convert &str to String or use as is if Paragraph can handle Vec<Line>
             .collect::<Vec<&str>>() // Collect as Vec<&str>
             .join("\n"); // Join into a single String
 
@@ -777,13 +778,40 @@ pub enum CommandStatus {
 }
 
 fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
-    let parts: Vec<&str> = command_string.split_whitespace().collect();
-    let command_name_opt = parts.get(0).cloned();
+    // Split command_string into parts, supporting quoted arguments
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let chars = command_string.chars().peekable();
+
+    for c in chars {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                // Don't include the quote in the argument
+            }
+            ' ' | '\t' if !in_quotes => {
+                if !current.is_empty() {
+                    parts.push(current.clone());
+                    current.clear();
+                }
+                // Skip the space
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    let command_name_opt = parts.first().map(|s| s.as_str());
     if command_name_opt.is_none() {
         app.command_msg = "No command entered.".to_string();
         return CommandStatus::Success(app.command_msg.clone());
     }
-    let args = &parts[1..];
+    let args: Vec<&str> = parts.iter().skip(1).map(|s| s.as_str()).collect();
 
     // Handle sort command separately as it depends heavily on visual mode context
     if command_name_opt == Some("sort") {
@@ -794,7 +822,7 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             return CommandStatus::Success(app.command_msg.clone());
         }
 
-        match parse_sort_flags(args) {
+        match parse_sort_flags(&args) {
             Ok(sort_params) => {
                 // selected_range() already considers the visual mode for its interpretation.
                 // However, the sort logic needs the original visual mode to determine primary sort axis.
@@ -815,7 +843,7 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
                 // Clean up after sort attempt
                 app.mode = Mode::Normal;
                 app.visual_start = None;
-                app.visual_mode_for_command = None;
+
                 app.input.clear();
                 return CommandStatus::Success(app.command_msg.clone());
             }
@@ -850,13 +878,9 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             return CommandStatus::Exit;
         }
         Some("w") | Some("write") => {
-            let save_path = if let Some(path) = args.get(0) {
+            let save_path = if let Some(path) = args.first() {
                 Some(path.to_string())
-            } else if let Some(ref filepath) = app.filepath {
-                Some(filepath.to_string_lossy().to_string())
-            } else {
-                None
-            };
+            } else { app.filepath.as_ref().map(|filepath| filepath.to_string_lossy().to_string()) };
             if let Some(path) = save_path {
                 match save_csv(app, &path) {
                     Ok(_) => app.command_msg = format!("Saved to {}", path),
@@ -889,13 +913,9 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             }
         }
         Some("wq") => {
-            let save_path = if let Some(path) = args.get(0) {
+            let save_path = if let Some(path) = args.first() {
                 Some(path.to_string())
-            } else if let Some(ref filepath) = app.filepath {
-                Some(filepath.to_string_lossy().to_string())
-            } else {
-                None
-            };
+            } else { app.filepath.as_ref().map(|filepath| filepath.to_string_lossy().to_string()) };
             if let Some(path) = save_path {
                 match save_csv(app, &path) {
                     Ok(_) => app.command_msg = format!("Saved to {}", path),
@@ -908,8 +928,8 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             return CommandStatus::Exit;
         }
         // goto <row> [: <col>]
-        Some("goto") | Some("r") => {
-            if let Some(row_str) = args.get(0) {
+        Some("goto") => {
+            if let Some(row_str) = args.first() {
                 if let Ok(row) = row_str.parse::<usize>() {
                     let col = if args.len() > 1 {
                         args[1].parse::<usize>().unwrap_or(0)
@@ -932,6 +952,88 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
                 app.command_msg = "Usage: goto <row> [: <col>]".to_string();
             }
         }
+        // r, jumps row
+        Some("r") | Some("row") => {
+            if let Some(row_str) = args.first() {
+                if let Ok(row) = row_str.parse::<usize>() {
+                    if row < app.rows {
+                        app.cursor_row = row;
+                        app.scroll_row = row.saturating_sub(app.view_rows / 2);
+                        app.command_msg = format!("Moved cursor to row {}", row);
+                    } else {
+                        app.command_msg = "Row out of bounds".to_string();
+                    }
+                } else {
+                    app.command_msg = "Invalid row number".to_string();
+                }
+            } else {
+                app.command_msg = "Usage: r <row>".to_string();
+            }
+        }
+        // c, jumps column
+        Some("c") | Some("col") => {
+            if let Some(col_str) = args.first() {
+                if let Ok(col) = col_str.parse::<usize>() {
+                    if col < app.cols {
+                        app.cursor_col = col;
+                        app.scroll_col = col.saturating_sub(app.view_cols / 2);
+                        app.command_msg = format!("Moved cursor to column {}", col);
+                    } else {
+                        app.command_msg = "Column out of bounds".to_string();
+                    }
+                } else {
+                    app.command_msg = "Invalid column number".to_string();
+                }
+            } else {
+                app.command_msg = "Usage: c <col>".to_string();
+            }
+        }
+        // fill, uses clipboard content to fill cells that are selected, otherwise use first arg as content
+        Some("fill") => {
+            if let Some(content_arg) = args.first() {
+            // Argument provided, use it to fill
+            if let Some(((r1, c1), (r2, c2))) = app.selected_range() {
+                app.snapshot(); // Save current state before filling
+                for r in r1..=r2 {
+                for c in c1..=c2 {
+                    if r < app.rows && c < app.cols {
+                    app.cells[r][c].content = content_arg.to_string();
+                    }
+                }
+                }
+                app.command_msg = format!(
+                "Filled cells ({}, {}) to ({}, {}) with '{}'",
+                r1, c1, r2, c2, content_arg
+                );
+            } else {
+                app.command_msg = "No selection to fill".to_string();
+            }
+            } else if !app.clipboard.is_empty() {
+            // No argument, but clipboard has content, use clipboard
+            // Assuming clipboard contains a single cell's content for fill for simplicity
+            let clipboard_content_to_fill = app.clipboard[0][0].content.clone();
+            if let Some(((r1, c1), (r2, c2))) = app.selected_range() {
+                app.snapshot(); // Save current state before filling
+                for r in r1..=r2 {
+                for c in c1..=c2 {
+                    if r < app.rows && c < app.cols {
+                    app.cells[r][c].content = clipboard_content_to_fill.clone();
+                    }
+                }
+                }
+                app.command_msg = format!(
+                "Filled cells ({}, {}) to ({}, {}) with clipboard content",
+                r1, c1, r2, c2
+                );
+            } else {
+                app.command_msg = "No selection to fill".to_string();
+            }
+            } else {
+            // No argument and clipboard is empty
+            app.command_msg = "Usage: fill <content> or copy to clipboard first".to_string();
+            }
+        }
+        // clear, clears all cells
         Some("clear") => {
             app.snapshot();
             app.cells = vec![
@@ -954,7 +1056,7 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             app.command_msg = "Redone last action".to_string();
         }
         Some("save") => {
-            if let Some(path) = args.get(0) {
+            if let Some(path) = args.first() {
                 match save_csv(app, path) {
                     Ok(_) => app.command_msg = format!("Saved to {}", path),
                     Err(e) => app.command_msg = format!("Error saving: {}", e),
@@ -964,7 +1066,7 @@ fn handle_command(app: &mut App, command_string: &str) -> CommandStatus {
             }
         }
         Some("load") => {
-            if let Some(path) = args.get(0) {
+            if let Some(path) = args.first() {
                 match load_csv(app, path) {
                     Ok(_) => {
                         app.command_msg = format!("Loaded from {}", path);
@@ -1183,48 +1285,123 @@ fn run_app<B: ratatui::backend::Backend>(
                 app.view_cols = 0;
             }
             // Ensure view_rows is also updated based on the main_area height for spreadsheet
-            app.view_rows = (main_area.height as usize).saturating_sub(1); // -1 for header row
+            app.view_rows = (main_area.height as usize).saturating_sub(3); // -1 for header row
 
             let mut lines = vec![];
-            let mut header = String::new();
-            header.push_str(&format!("{:width$}", " ", width = number_width));
-            for c in app.scroll_col..(app.scroll_col + app.view_cols).min(app.cols) {
-                header += &format!("{:<width$}", c, width = app.cwidth + 2);
+            let header = String::new();
+            let mut header_spans: Vec<Span> = Vec::new();
+            // Add empty span for the space above row numbers
+            header_spans.push(Span::raw(format!("{:width$}", " ", width = number_width)));
+
+            for c_idx in app.scroll_col..(app.scroll_col + app.view_cols).min(app.cols) {
+                let mut is_highlighted = false;
+
+                // Check if the cursor is in the current column
+                if c_idx == app.cursor_col {
+                    is_highlighted = true;
+                }
+
+                // Check if the current column is part of a visual selection's column range
+                if !is_highlighted { // Only check if not already highlighted by the cursor
+                    if let Some(((_r1, sel_c1), (_r2, sel_c2))) = app.selected_range() {
+                        // app.selected_range() provides the correct column bounds (sel_c1, sel_c2)
+                        // based on the current visual mode (VisualRow, VisualColumn, VisualBlock).
+                        // For VisualRow, sel_c1 will be 0 and sel_c2 will be app.cols - 1,
+                        // effectively highlighting all column headers.
+                        if c_idx >= sel_c1 && c_idx <= sel_c2 {
+                            is_highlighted = true;
+                        }
+                    }
+                }
+
+                let col_text = format!("{:<width$}", c_idx, width = app.cwidth + 2);
+                let style = if is_highlighted {
+                    Style::default().add_modifier(Modifier::REVERSED) // Style for highlighted header
+                } else {
+                    Style::default() // Default style for non-highlighted header
+                };
+                header_spans.push(Span::styled(col_text, style));
             }
-            lines.push(Line::from(Span::raw(header)));
+            lines.push(Line::from(header_spans));
 
             for r in app.scroll_row..(app.scroll_row + app.view_rows).min(app.rows) {
-                let mut row_str = format!("{:number_width$}", r, number_width = number_width);
+                let mut row_spans: Vec<Span> = Vec::new();
+                let mut is_row_highlighted = false;
+                // Highlight if cursor is on this row
+                if r == app.cursor_row {
+                    is_row_highlighted = true;
+                }
+
+                // Highlight if this row is part of a visual selection's vertical span
+                if !is_row_highlighted {
+                    if let Some(((sel_r1, _), (sel_r2, _))) = app.selected_range() {
+                        if r >= sel_r1 && r <= sel_r2 {
+                            is_row_highlighted = true;
+                        }
+                    }
+                }
+
+                let row_number_text = format!("{:width$}", r, width = number_width);
+                let row_number_style = if is_row_highlighted {
+                    Style::default().add_modifier(Modifier::REVERSED) // Style for highlighted row number
+                } else {
+                    Style::default() // Default style for non-highlighted row number
+                };
+                row_spans.push(Span::styled(row_number_text, row_number_style));
+
+
                 for c in app.scroll_col..(app.scroll_col + app.view_cols).min(app.cols) {
-                    let content = if r < app.rows && c < app.cols {
-                        app.cells[r][c]
-                            .content
-                            .chars()
-                            .take(app.cwidth)
-                            .collect::<String>()
+                    // Get cell content, truncate, and center it
+                    let original_content = if r < app.rows && c < app.cols {
+                        app.cells[r][c].content.clone()
                     } else {
-                        "".to_string() // Should not happen if logic is correct
+                        "".to_string()
                     };
-                    let selected = if let Some(((r1, c1), (r2, c2))) = app.selected_range() {
+
+                    let truncated_content = original_content
+                        .chars()
+                        .take(app.cwidth)
+                        .collect::<String>();
+                    let centered_content =
+                        format!("{:^width$}", truncated_content, width = app.cwidth);
+
+                    // Determine if the cell is the cursor or part of a selection
+                    let is_cursor = r == app.cursor_row && c == app.cursor_col;
+                    let is_selected = if let Some(((r1, c1), (r2, c2))) = app.selected_range() {
+                        // selected_range() already provides the correct bounding box for the current visual mode
                         r >= r1 && r <= r2 && c >= c1 && c <= c2
                     } else {
                         false
                     };
 
-                    let display_char = if r == app.cursor_row && c == app.cursor_col {
-                        format!("[{:^width$}]", content, width = app.cwidth)
-                    } else if selected {
-                        format!("*{:^width$}*", content, width = app.cwidth)
+                    let cell_text: String;
+                    let cell_style: Style;
+
+                    if is_cursor {
+                        cell_text = format!("[{}]", centered_content); // Keep brackets for cursor
+                        cell_style = Style::default().add_modifier(Modifier::REVERSED); // Use reverse video for cursor
+                    } else if is_selected {
+                        cell_text = format!(" {centered_content} "); // Keep asterisks or use spaces
+                        // Style for selected cells (e.g., background color)
+                        cell_style = Style::default().bg(Color::DarkGray); // Example: Dark gray background
+                    // Consider adding .fg(Color::White) if needed for contrast
                     } else {
-                        format!(" {:^width$} ", content, width = app.cwidth)
-                    };
-                    row_str += &display_char;
+                        cell_text = format!(" {} ", centered_content); // Spaces for normal cells
+                        cell_style = Style::default(); // Default style for normal cells
+                    }
+                    row_spans.push(Span::styled(cell_text, cell_style));
                 }
-                lines.push(Line::from(Span::raw(row_str)));
+                lines.push(Line::from(row_spans));
             }
 
-            let sheet_block = Block::default().title("Spreadsheet").borders(Borders::ALL);
-            f.render_widget(Paragraph::new(lines).block(sheet_block), main_area);
+                        let title = if let Some(path) = &app.filepath {
+                            format!("Spreadsheet - {}", path.file_name().unwrap_or_default().to_string_lossy())
+                        } else {
+                            "Spreadsheet".to_string()
+                        };
+                        let sheet_block = Block::default().title(title).borders(Borders::ALL);
+                        f.render_widget(Paragraph::new(lines).block(sheet_block), main_area);
+
 
             // Inspector Bar
             let current_cell_content = if app.rows > 0 && app.cols > 0 {
@@ -1234,7 +1411,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 "N/A"
             };
             let inspector_text = format!(
-                "Cell (R{}, C{}): \"{}\" | Size: {}Rx{}C",
+                "Cell ({}, {}): \"{}\" | Size: {}Rx{}C",
                 app.cursor_row, app.cursor_col, current_cell_content, app.rows, app.cols,
             );
             let inspector_paragraph = Paragraph::new(inspector_text);
@@ -1248,7 +1425,6 @@ fn run_app<B: ratatui::backend::Backend>(
                 Mode::VisualRow => "-- VISUAL LINE --".into(),
                 Mode::VisualBlock => "-- VISUAL BLOCK --".into(),
                 Mode::VisualColumn => "-- VISUAL COLUMN --".into(),
-                Mode::Sort => format!("SORT:{}", app.input),
             };
             f.render_widget(Paragraph::new(footer_text), footer_area);
 
@@ -1283,7 +1459,7 @@ fn run_app<B: ratatui::backend::Backend>(
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 // look for ctrl-c
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     app.command_msg = "Exiting...".to_string();
                     return Ok(()); // Exit the application
                 }
@@ -1349,6 +1525,22 @@ fn run_app<B: ratatui::backend::Backend>(
                     // Existing key handling logic when help and popup_menu are not shown
                     match app.mode {
                         Mode::Normal => match key.code {
+                            KeyCode::Char(',') if key.modifiers.is_empty() => {
+                                // restore selection range
+                                if let Some((start_coords, end_coords)) = app.last_selection_range {
+                                    app.mode = app
+                                        .visual_mode_for_command
+                                        .clone()
+                                        .unwrap_or(Mode::VisualBlock);
+                                    app.visual_start = Some(start_coords);
+                                    // cursor should be at end of last selection
+                                    app.cursor_row = end_coords.0;
+                                    app.cursor_col = end_coords.1;
+                                } else {
+                                    app.command_msg =
+                                        "No previous selection to restore.".to_string();
+                                }
+                            }
                             // g to go to the top
                             KeyCode::Char('g') if key.modifiers.is_empty() => {
                                 app.cursor_row = 0;
@@ -1447,7 +1639,6 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Esc => {
                                 app.mode = Mode::Normal;
                                 app.visual_start = None;
-                                app.visual_mode_for_command = None;
                             }
                             KeyCode::Char('i') => {
                                 app.mode = Mode::Insert;
@@ -1499,7 +1690,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Char('>') => {
                                 app.snapshot();
-                                app.cwidth = app.cwidth + 1;
+                                app.cwidth += 1;
                                 if app.cwidth > 20 {
                                     app.cwidth = 20; // Limit max width
                                 }
@@ -1510,7 +1701,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                 if app.view_cols > 0 {
                                     // Calculate the maximum possible scroll_col value to prevent scrolling beyond content
                                     let max_scroll_col = app.cols.saturating_sub(app.view_cols);
-                                    app.scroll_col = (app.scroll_col + app.view_cols).min(max_scroll_col);
+                                    app.scroll_col =
+                                        (app.scroll_col + app.view_cols).min(max_scroll_col);
                                 }
                                 // Set cursor to the new scroll position, clamped to valid column index
                                 app.cursor_col = app.scroll_col.min(app.cols.saturating_sub(1));
@@ -1530,7 +1722,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                 if app.view_rows > 0 {
                                     // Calculate the maximum possible scroll_row value
                                     let max_scroll_row = app.rows.saturating_sub(app.view_rows);
-                                    app.scroll_row = (app.scroll_row + app.view_rows).min(max_scroll_row);
+                                    app.scroll_row =
+                                        (app.scroll_row + app.view_rows).min(max_scroll_row);
                                 }
                                 // Set cursor to the new scroll position, clamped to valid row index
                                 app.cursor_row = app.scroll_row.min(app.rows.saturating_sub(1));
@@ -1577,7 +1770,6 @@ fn run_app<B: ratatui::backend::Backend>(
                                 } else {
                                     app.mode = Mode::Normal;
                                     app.visual_start = None;
-                                    app.visual_mode_for_command = None;
                                 }
                                 app.command_history_index = None; // Reset history navigation
                                 app.current_command_input_buffer.clear();
@@ -1605,7 +1797,6 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.input.clear();
                                 app.mode = Mode::Normal;
                                 app.visual_start = None;
-                                app.visual_mode_for_command = None;
                             }
                             KeyCode::Char(c) => app.input.push(c),
                             KeyCode::Backspace => {
@@ -1656,11 +1847,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                 let current_input = app.input.clone();
                                 let parts: Vec<&str> = current_input.split_whitespace().collect();
 
-                                if parts.len() >= 1 {
+                                if !parts.is_empty() {
                                     let cmd_token = parts[0];
                                     if (cmd_token == "load" || cmd_token == "save")
                                         && (parts.len() == 1
-                                            || (parts.len() >= 1 && !current_input.ends_with(' ')))
+                                            || (!parts.is_empty() && !current_input.ends_with(' ')))
                                     {
                                         let path_to_complete = if parts.len() > 1 {
                                             // Removed mut
@@ -1740,12 +1931,27 @@ fn run_app<B: ratatui::backend::Backend>(
                             _ => {}
                         },
                         Mode::VisualRow | Mode::VisualBlock | Mode::VisualColumn => {
+                            // store selection range for visual modes
+                            app.visual_mode_for_command = Some(app.mode.clone());
+
                             match key.code {
+                                KeyCode::Char('v')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    // Toggle visual column mode
+                                    app.mode = Mode::VisualColumn;
+                                    if app.visual_start.is_none() {
+                                        app.visual_start = Some((app.cursor_row, app.cursor_col));
+                                    }
+                                    app.visual_mode_for_command = Some(app.mode.clone());
+                                }
                                 KeyCode::Char('v') => {
-                                    // Toggle visual mode off
-                                    app.mode = Mode::Normal;
-                                    app.visual_start = None;
-                                    app.visual_mode_for_command = None;
+                                    // Toggle visual to block mode
+                                    app.mode = Mode::VisualBlock;
+                                    if app.visual_start.is_none() {
+                                        app.visual_start = Some((app.cursor_row, app.cursor_col));
+                                    }
+                                    app.visual_mode_for_command = Some(app.mode.clone());
                                 }
                                 KeyCode::Char('V') => {
                                     // Toggle visual row mode
@@ -1775,7 +1981,6 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Esc => {
                                     app.mode = Mode::Normal;
                                     app.visual_start = None;
-                                    app.visual_mode_for_command = None;
                                 }
                                 KeyCode::Char(':') => {
                                     app.input.clear();
@@ -1895,7 +2100,6 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         app.mode = Mode::Normal;
                                         app.visual_start = None;
-                                        app.visual_mode_for_command = None;
                                     }
                                 }
                                 KeyCode::Char('p') => {
@@ -1916,14 +2120,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                             }
                                             app.mode = Mode::Normal;
                                             app.visual_start = None;
-                                            app.visual_mode_for_command = None;
-                                        } else {
-                                            if !app.clipboard.is_empty()
-                                                && !app.clipboard[0].is_empty()
-                                            {
-                                                app.cells[app.cursor_row][app.cursor_col].content =
-                                                    app.clipboard[0][0].content.clone();
-                                            }
+                                        } else if !app.clipboard.is_empty()
+                                            && !app.clipboard[0].is_empty()
+                                        {
+                                            app.cells[app.cursor_row][app.cursor_col].content =
+                                                app.clipboard[0][0].content.clone();
                                         }
                                     }
                                 }
@@ -1942,7 +2143,6 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         app.mode = Mode::Normal;
                                         app.visual_start = None;
-                                        app.visual_mode_for_command = None;
                                     } else {
                                         // Copy single cell to clipboard
                                         app.clipboard = vec![vec![
@@ -1953,28 +2153,65 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 _ => {}
                             }
+
+                            if app.last_selection_range.is_none() {
+                                app.last_selection_range = app.selected_range();
+                            } else {
+                                // Update the last selection range if it exists
+                                if let Some((start_row, start_col)) = app.visual_start {
+                                    app.last_selection_range = Some((
+                                        (start_row, start_col),
+                                        (app.cursor_row, app.cursor_col),
+                                    ));
+                                }
+                            }
                         }
                         _ => {}
                     }
                 }
 
-                // Dynamically calculate margin based on viewable area
-                let margin = (app.view_rows / 8).max(2);
-
                 // Vertical scroll
-                if app.cursor_row < app.scroll_row + margin {
-                    app.scroll_row = app.cursor_row.saturating_sub(margin);
-                } else if app.cursor_row >= app.scroll_row + app.view_rows - margin {
-                    app.scroll_row = app.cursor_row + margin + 1 - app.view_rows;
+                if app.view_rows > 0 {
+                    if app.cursor_row < app.scroll_row {
+                        // Cursor is above the visible area, scroll up
+                        app.scroll_row = app.cursor_row;
+                    } else if app.cursor_row >= app.scroll_row + app.view_rows {
+                        // Cursor is at or below the last visible row, scroll down
+                        app.scroll_row = app.cursor_row - app.view_rows + 1;
+                    }
+                } else {
+                    // No viewable rows, try to keep scroll_row consistent with cursor_row
+                    app.scroll_row = app.cursor_row;
                 }
 
                 // Horizontal scroll
-                let hmargin = (app.view_cols / 8).max(2);
-                if app.cursor_col < app.scroll_col + hmargin {
-                    app.scroll_col = app.cursor_col.saturating_sub(hmargin);
-                } else if app.cursor_col >= app.scroll_col + app.view_cols - hmargin {
-                    app.scroll_col = app.cursor_col + hmargin + 1 - app.view_cols;
+                if app.view_cols > 0 {
+                    if app.cursor_col < app.scroll_col {
+                        // Cursor is to the left of the visible area, scroll left
+                        app.scroll_col = app.cursor_col;
+                    } else if app.cursor_col >= app.scroll_col + app.view_cols {
+                        // Cursor is at or to the right of the last visible column, scroll right
+                        app.scroll_col = app.cursor_col - app.view_cols + 1;
+                    }
+                } else {
+                    // No viewable columns, try to keep scroll_col consistent with cursor_col
+                    app.scroll_col = app.cursor_col;
                 }
+
+                // Clamp scroll values to ensure they are within valid ranges
+                if app.rows > 0 {
+                    app.scroll_row = app.scroll_row.min(app.rows.saturating_sub(app.view_rows));
+                } else {
+                    app.scroll_row = 0; // If no rows, scroll_row must be 0
+                }
+                // app.scroll_row is usize, so it's implicitly >= 0.
+
+                if app.cols > 0 {
+                    app.scroll_col = app.scroll_col.min(app.cols.saturating_sub(app.view_cols));
+                } else {
+                    app.scroll_col = 0; // If no cols, scroll_col must be 0
+                }
+                // app.scroll_col is usize, so it's implicitly >= 0.
             }
         }
     }
@@ -2213,6 +2450,5 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
-
 
 // simple forth script engine to create formulas and attach to cells
